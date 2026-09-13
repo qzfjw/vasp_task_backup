@@ -1,0 +1,4 @@
+interface:
+  display_name: "VASP Task Backup"
+  short_description: "备份 VASP 任务到 /home/bak 并登记 VaspTaskList.md"
+  default_prompt: "使用 $vasp-task-backup 备份当前 VASP 项目的服务器端计算目录到备份主机（默认 yang）的 /home/bak（lan 上的项目经本机中转复制过去），并把任务ID、地址、时间、使用者、使用过程和计算结论写入该主机的 VaspTaskList.md。"

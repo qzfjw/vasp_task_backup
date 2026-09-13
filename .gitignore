@@ -1,0 +1,3 @@
+# 本机私有覆盖配置，不入库
+config/servers.local.psd1
+*.tmp
