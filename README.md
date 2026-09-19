@@ -21,7 +21,7 @@ Codex skill：把一个 VASP 项目的服务器端计算目录归档到备份主
 | 本机 | Windows + PowerShell 5.1 或 PowerShell 7 |
 | OpenSSH | `ssh`、`scp` 在 PATH 中（Windows 自带的 OpenSSH 客户端即可） |
 | 免密登录 | 本机 SSH config 中已有 `yang-login`、`lan-login`，且已配置公钥登录（`ssh yang-login id -un` 不提示密码） |
-| 备份主机 | 备份主机（默认 yang）上的 `/home/bak` 已存在且当前账号可写 |
+| 备份主机 | 备份主机（默认 yang）上的 `/home/bak` 已存在且当前账号可写，并提供 `flock` |
 | 项目主机 | 任务目录位于项目所在服务器的 `~/vasp_codex/` 下 |
 
 缺少 `/home/bak` 或不可写时脚本会拒绝执行并打印管理员命令，不会提权，也不会静默改写到别的目录。临时替代是显式传 `-BackupRoot`、`-LogPath` 指向已存在且可写的目录。

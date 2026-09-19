@@ -161,7 +161,7 @@ $plan = [pscustomobject]@{
     BackupSshAlias    = $backupTarget.SshAlias
     SshAlias          = $serverInfo.SshAlias
     Project           = $resolvedProject
-    Sources           = ($sources -join ', ')
+    Sources           = ($sources -join '<br>')
     BackupRoot        = ($resolvedRoots -join ', ')
     ProjectDirectory  = (($resolvedRoots | ForEach-Object { "$_/$resolvedProject" }) -join ' or ')
     BackupLayout      = '<项目目录>/<yyyyMMdd_HHmmss>/ (one folder per project; each backup is a subfolder)'
@@ -648,10 +648,8 @@ $localBytes = 0
 $localVerify = 'NOT_REQUESTED'
 if ($resolvedLocalDirectory) {
     $remoteLocalDirectory = "$backupDirectory/$localSubdirectory"
-    & ssh -o BatchMode=yes $targetSshAlias "mkdir -p '$remoteLocalDirectory'"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to create the remote local-project directory: $remoteLocalDirectory"
-    }
+    $mkdirLocalScript = "set -euo pipefail`nmkdir -p $(ConvertTo-BashLiteral -Value $remoteLocalDirectory)"
+    Invoke-VaspRemoteBash -SshAlias $targetSshAlias -Script $mkdirLocalScript -FailureMessage 'Failed to create the remote local-project directory' | Out-Host
     $leaf = Split-Path -Leaf $resolvedLocalDirectory
     $localFiles = @(Get-ChildItem -LiteralPath $resolvedLocalDirectory -Recurse -File -Force)
     $localRows = foreach ($file in $localFiles) {
@@ -669,16 +667,17 @@ if ($resolvedLocalDirectory) {
         throw "Uploading the local project directory failed. The server-side backup was kept at $backupDirectory."
     }
 
+    $remoteLocalTargetLiteral = ConvertTo-BashLiteral -Value "$remoteLocalDirectory/$leaf"
     $verifyScript = @'
 set -euo pipefail
-target="__TARGET__"
+target=__TARGET__
 if [[ ! -d "$target" ]]; then
     echo "ERROR: uploaded local project directory is missing: $target" >&2
     exit 5
 fi
 cd "$target"
 find . -type f -print0 | sort -z | xargs -0 -r sha256sum
-'@.Replace('__TARGET__', "$remoteLocalDirectory/$leaf")
+'@.Replace('__TARGET__', $remoteLocalTargetLiteral)
     $remoteRows = Invoke-VaspRemoteBash -SshAlias $targetSshAlias -Script $verifyScript -FailureMessage 'Local project verification failed'
     $remoteManifest = (@($remoteRows | Where-Object { $_ -match '^[0-9a-f]{64}  ' }) | Sort-Object) -join "`n"
     if ($localManifest -eq $remoteManifest) {
@@ -704,7 +703,7 @@ $result = [pscustomobject]@{
     Timestamp        = [string]$fields['timestamp']
     ProjectDirectory = [string]$fields['project_root']
     BackupDirectory  = $backupDirectory
-    SourcePaths      = ($sources -join ', ')
+    SourcePaths      = ($sources -join '<br>')
     SourceCount      = [int]$fields['sources']
     FileCount        = [int64]$fields['files']
     SizeMB           = $serverMb

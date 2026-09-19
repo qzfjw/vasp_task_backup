@@ -129,6 +129,13 @@ function Assert-VaspSafeRelativePath {
     }
 }
 
+function ConvertTo-BashLiteral {
+    param([Parameter(Mandatory)][string]$Value)
+
+    # Bash single-quoted strings only need apostrophes split out and escaped.
+    return "'" + $Value.Replace("'", "'\''") + "'"
+}
+
 function ConvertTo-BashLiteralList {
     param([string[]]$Values = @())
 
@@ -136,7 +143,7 @@ function ConvertTo-BashLiteralList {
     if ($list.Count -eq 0) {
         return ''
     }
-    return (($list | ForEach-Object { "'$_'" }) -join ' ')
+    return (($list | ForEach-Object { ConvertTo-BashLiteral -Value ([string]$_) }) -join ' ')
 }
 
 function Resolve-VaspServerConfigPath {
@@ -256,6 +263,7 @@ function Get-VaspServer {
     if ([string]::IsNullOrWhiteSpace($workRoot)) {
         throw "Setting 'WorkRoot' is missing for server '$serverKey'."
     }
+    Assert-VaspSafeRelativePath -Value $workRoot -Label "WorkRoot for server '$serverKey'"
 
     $env:VASP_SERVER_KEY = $serverKey
     $env:VASP_SERVER_NAME = [string](Get-VaspField -InputObject $serverConfig -Name 'DisplayName' -Default $serverKey)
@@ -387,6 +395,7 @@ Export-ModuleMember -Function @(
     'Get-VaspField',
     'Assert-VaspSafeName',
     'Assert-VaspSafeRelativePath',
+    'ConvertTo-BashLiteral',
     'ConvertTo-BashLiteralList',
     'Get-VaspServerConfig',
     'Get-VaspBackupTarget',

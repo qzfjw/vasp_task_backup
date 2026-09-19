@@ -150,14 +150,6 @@ $rowCells = @(
     (ConvertTo-VaspMarkdownCell -Value $Notes)
 )
 $row = '| ' + ($rowCells -join ' | ') + ' |'
-if ($row.Contains('__SRC_HOME__') -or $row.Contains('__SRC_USER__')) {
-    $sourceIdentity = (@(Invoke-VaspRemoteBash -SshAlias $serverInfo.SshAlias -Script 'printf ''%s'' "$(id -un)|$HOME"' -FailureMessage 'Failed to resolve the source server user and HOME directory') -join '').Trim()
-    $sourceParts = @($sourceIdentity.Split('|'))
-    if ($sourceParts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($sourceParts[0]) -or [string]::IsNullOrWhiteSpace($sourceParts[1])) {
-        throw "Could not resolve the source server user and HOME directory (got: $sourceIdentity)."
-    }
-    $row = $row.Replace('__SRC_USER__', $sourceParts[0]).Replace('__SRC_HOME__', $sourceParts[1])
-}
 
 $separator = '| ' + (($columns | ForEach-Object { '---' }) -join ' | ') + ' |'
 $headerRow = '| ' + ($columns -join ' | ') + ' |'
@@ -218,12 +210,21 @@ if (-not $Yes) {
     return $plan
 }
 
+if ($row.Contains('__SRC_HOME__') -or $row.Contains('__SRC_USER__')) {
+    $sourceIdentity = (@(Invoke-VaspRemoteBash -SshAlias $serverInfo.SshAlias -Script 'printf ''%s'' "$(id -un)|$HOME"' -FailureMessage 'Failed to resolve the source server user and HOME directory') -join '').Trim()
+    $sourceParts = @($sourceIdentity.Split('|'))
+    if ($sourceParts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($sourceParts[0]) -or [string]::IsNullOrWhiteSpace($sourceParts[1])) {
+        throw "Could not resolve the source server user and HOME directory (got: $sourceIdentity)."
+    }
+    $row = $row.Replace('__SRC_USER__', $sourceParts[0]).Replace('__SRC_HOME__', $sourceParts[1])
+}
+
 $rowBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($row))
 $headerBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($headerText))
 $quotedCandidates = ConvertTo-BashLiteralList -Values $resolvedLogCandidates
 
 $logScript = @'
-set -uo pipefail
+set -euo pipefail
 
 log=''
 log_candidates=(__CANDIDATES__)
@@ -243,8 +244,17 @@ if [[ -z "$log" ]]; then
 fi
 
 lock="${log}.lock"
-if command -v flock >/dev/null 2>&1; then
-    if exec 9>>"$lock" 2>/dev/null; then flock 9; fi
+if ! command -v flock >/dev/null 2>&1; then
+    echo "ERROR: flock is required for safe task-log updates." >&2
+    exit 4
+fi
+if ! exec 9>>"$lock" 2>/dev/null; then
+    echo "ERROR: could not open task-log lock: $lock" >&2
+    exit 4
+fi
+if ! flock -x 9; then
+    echo "ERROR: could not acquire task-log lock: $lock" >&2
+    exit 4
 fi
 
 server_time="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -256,6 +266,7 @@ row="${row//__LOG_HOME__/$HOME}"
 marker='__MARKER__'
 task_id='__TASK_ID__'
 tmp="${log}.tmp.$$"
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
 action=''
 
 if [[ -f "$log" ]] && grep -qF "$marker" "$log"; then
@@ -283,11 +294,9 @@ else
     action='appended'
 fi
 
-if mv -f "$tmp" "$log" 2>/dev/null; then
-    :
-else
-    cat "$tmp" > "$log"
-    rm -f "$tmp"
+if ! mv -f "$tmp" "$log" 2>/dev/null; then
+    echo "ERROR: atomic task-log replacement failed: $log" >&2
+    exit 6
 fi
 
 if grep -qF "| ${task_id} |" "$log"; then
