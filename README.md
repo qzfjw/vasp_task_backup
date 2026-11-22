@@ -1,278 +1,211 @@
 # vasp-task-backup
 
-Codex skill：把一个 VASP 项目的服务器端计算目录归档到备份主机的 `/home/bak`，并把任务关键信息登记到该主机上的 `VaspTaskList.md`。
+Codex skill：从 `yang` 或 `lan` 扫描指定的绝对路径，把可识别的 VASP 任务备份到备份主机 `yang` 的 `/home/bak`，按原服务器绝对路径镜像，并把登记信息增量写入 `/home/bak/VaspLog.xlsx`。
 
-项目在 **yang** 时，复制在 yang 本机完成；项目在 **lan** 时，数据经本机 OpenSSH 用 `scp -3` 中转复制到 yang，在源、目标两侧各自计算清单摘要并比对，一致才算通过。所有项目的备份和日志都落在**同一台备份主机**（默认 yang）上，所以 lan 自己不需要 `/home/bak`，也不需要管理员在 lan 上额外授权。
+## 核心行为
 
-本 skill 独立运行，不依赖 `fang-ssh-skill`；它只做备份与登记，不提交、不监控、不取消 VASP 作业。
+- **输入文件要求**：任务必须包含 `INCAR` 和 `POSCAR`。`OUTCAR` 可以缺失；如果存在，则仍要求尾部有 VASP 正常结束标记且无明确致命错误。
+- **按绝对路径镜像**：
+  - `/home/qzxy/a` → `/home/bak/qzxy/a`
+  - `/home/data/a/b` → `/home/bak/data/a/b`
+  - lan 的 `/data/group/user/c` → `/home/bak/data/group/user/c`
+- **增量备份**：任务未修改且镜像完整时跳过；源任务修改或镜像缺失/被外部改动时重新备份到同一镜像路径。
+- **保留旧版本**：被替换的旧目录放在 `/home/bak/.vasp_task_backup/versions/`。
+- **统一登记 Excel**：只维护 `/home/bak/VaspLog.xlsx`，不再写 `VaspTaskList.md`。
+- **无 openpyxl 依赖**：服务器系统 Python 3.9+ 标准库即可更新 xlsx。
+- **跨主机校验**：lan 经本机 `scp -3` 中转；源端 tar + SHA256 + manifest，目标端复验后原子落地。
 
-## 特性
+## 备份与登记判定
 
-- **一个项目一个文件夹**：`/home/bak/<项目名>/`，每次备份进入 `<yyyyMMdd_HHmmss>` 子目录；同名目录已存在时停止，不覆盖、不合并、不删除。
-- **先计划后执行**：不带 `-Yes` 只做只读检查（备份根可写性、每个源目录的文件数和总大小）并打印目标路径，确认后才复制。
-- **复制后校验**：逐项比对文件数、总字节数和 SHA256 清单，输出 `verify=PASS` 才算成功；失败时保留不完整目录并报告位置，不自动清理。
-- **统一任务日志**：`/home/bak/VaspTaskList.md` 全局一份，`服务器` 列区分 yang/lan；`flock` 加锁 + 临时文件原子替换，同一任务ID再次写入时更新原行。
-- **可选归档本机目录**：`-LocalDirectory` 把本机项目目录上传到备份目录的 `local_project/`，同样做 SHA256 核对。
+任务目录必须包含普通文件：
+
+```text
+INCAR
+POSCAR
+```
+
+`OUTCAR` 是可选文件，例如计算完成后用户可能已将其删除；缺少 `OUTCAR` 时仍会备份目录并登记。若 `OUTCAR` 存在，则在最后 256 KiB 中查找：
+
+```text
+General timing and accounting informations for this job
+```
+
+以下情况会使任务进入“不可备份”报告，不复制、不新增登记：
+
+- 缺少 `INCAR` 或 `POSCAR`。
+- OUTCAR 没有正常结束标记。
+- 尾部出现 `ZBRENT: fatal error`、`VERY BAD NEWS! internal error`、`Error EDDDAV`、段错误等明确致命标记。
 
 ## 前置条件
 
 | 项 | 要求 |
 |---|---|
-| 本机 | Windows + PowerShell 5.1 或 PowerShell 7 |
-| OpenSSH | `ssh`、`scp` 在 PATH 中（Windows 自带的 OpenSSH 客户端即可） |
-| 免密登录 | 本机 SSH config 中已有 `yang-login`、`lan-login`，且已配置公钥登录（`ssh yang-login id -un` 不提示密码） |
-| 备份主机 | 备份主机（默认 yang）上的 `/home/bak` 已存在且当前账号可写，并提供 `flock` |
-| 项目主机 | 任务目录位于项目所在服务器的 `~/vasp_codex/` 下 |
+| 本机 | Windows PowerShell 5.1 或 PowerShell 7 |
+| OpenSSH | `ssh`、`scp` 在 PATH，支持 `scp -3` |
+| 登录 | SSH config 已配置 `yang-login`、`lan-login` 公钥免密登录 |
+| yang | `/home/bak` 已存在且当前账号可写；有 `flock`、`rsync`、`tar`、`sha256sum` |
+| 源服务器 | Python 3.9+、`tar`；yang 本机流程还需要 `rsync` |
+| Python 包 | 不需要 `openpyxl` 或 pandas |
 
-缺少 `/home/bak` 或不可写时脚本会拒绝执行并打印管理员命令，不会提权，也不会静默改写到别的目录。临时替代是显式传 `-BackupRoot`、`-LogPath` 指向已存在且可写的目录。
-
-## 安装
-
-### 方式一：git clone（推荐）
+以下命令应直接返回用户名而不是询问密码：
 
 ```powershell
-$dest = Join-Path $HOME '.codex\skills\vasp_task_backup'
-git clone https://github.com/qzfjw/vasp_task_backup.git $dest
+ssh yang-login id -un
+ssh lan-login id -un
 ```
-
-如果该目录已存在（例如之前手动拷过一份），先改名或删掉再 clone。
-
-更新到最新版本：
-
-```powershell
-git -C $dest pull --ff-only
-```
-
-### 方式二：手动复制
-
-把仓库整个目录放到下面这个位置：
-
-```text
-%USERPROFILE%\.codex\skills\vasp_task_backup
-```
-
-要点是保留 `SKILL.md` 与 `scripts/`、`config/`、`references/` 的相对位置，不要只复制脚本。
-
-### 目录结构
-
-```text
-vasp_task_backup/
-├─ SKILL.md                             skill 定义（Codex 读取）
-├─ README.md                            本文件
-├─ agents/openai.yaml                   界面名称与默认提示词
-├─ config/
-│  ├─ servers.psd1                      预置服务器与备份主机
-│  ├─ servers.local.example.psd1        本机覆盖示例
-│  └─ rules/backup-rules.psd1           项目名、备份布局、日志列定义
-├─ references/task-log-format.md        日志字段与写入规则
-└─ scripts/
-   ├─ lib/VaspTaskBackup.psm1           公共函数
-   ├─ new_vasp_project.ps1              建立当前任务的项目绑定
-   ├─ backup_current_task.ps1           备份当前项目
-   ├─ update_task_log.ps1               写入或更新任务日志
-   ├─ backup_and_log.ps1                备份 + 登记（推荐入口）
-   ├─ list_vasp_projects.ps1            查看远程目录、备份与日志
-   ├─ select_server.ps1                 加载指定服务器的配置与环境
-   └─ check_ssh_hosts.ps1               检查 SSH 别名解析与免密登录
-```
-
-### 首次配置
-
-`config/servers.psd1` 已预置 yang、lan 的 SSH 别名和备份主机。只有需要在本机覆盖别名、主机或备份主机时才创建本地配置：
-
-```powershell
-$SkillRoot = Join-Path $HOME '.codex\skills\vasp_task_backup'
-Copy-Item "$SkillRoot/config/servers.local.example.psd1" "$SkillRoot/config/servers.local.psd1"
-```
-
-`config/servers.local.psd1` 是本机私有配置，已被 `.gitignore` 排除，不要提交。
-
-### 验证安装
-
-```powershell
-$SkillRoot = Join-Path $HOME '.codex\skills\vasp_task_backup'
-
-# 检查两台服务器的免密登录
-& "$SkillRoot/scripts/check_ssh_hosts.ps1" -Server yang
-& "$SkillRoot/scripts/check_ssh_hosts.ps1" -Server lan
-
-# 列出远程任务目录、已有备份和日志文件（只读）
-& "$SkillRoot/scripts/list_vasp_projects.ps1" -Server yang
-```
-
-`Status : PASS` 表示该服务器可用。之后在对话中用 `$vasp-task-backup` 触发这个 skill。
 
 ## 使用
 
-一个任务对应一个项目，备份默认只针对“当前项目”。当前项目由当前目录（或其上层目录）中的 `.codex-vasp-project.json` 唯一确定。
+### 1. 只读计划
 
-### 1. 开始新任务时建立项目
+先不加 `-Yes`，或显式使用 `-DryRun`：
 
 ```powershell
 $SkillRoot = Join-Path $HOME '.codex\skills\vasp_task_backup'
-
-& "$SkillRoot/scripts/new_vasp_project.ps1" `
+& "$SkillRoot/scripts/backup_completed_tasks.ps1" `
   -Server yang `
-  -ProjectName mos2_u `
-  -Source vasp_codex/mos2_u_relax,vasp_codex/mos2_u_scf,vasp_codex/mos2_u_band
+  -Path /home/qzxy,/home/data/a `
+  -DryRun
 ```
 
-脚本在当前目录写入 `.codex-vasp-project.json`，记录服务器、项目名、工作根目录和本项目包含的远程目录；不加 `-Source` 时默认只包含 `vasp_codex/<项目名>`。项目名必须匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`。加 `-CreateRemote` 会顺便创建缺失的远程目录，`-Force` 才会覆盖已存在的绑定。
+计划会显示：
 
-### 2. 先看计划
+- 扫描路径
+- 可备份任务数
+- 新增、修改、未变化数量
+- 不可备份任务及原因样例
+- 每个需要备份任务的源路径和目标路径
+
+### 2. 执行备份
 
 ```powershell
-& "$SkillRoot/scripts/backup_current_task.ps1"
+& "$SkillRoot/scripts/backup_completed_tasks.ps1" `
+  -Server yang `
+  -Path /home/qzxy,/home/data/a `
+  -Yes
 ```
 
-这一步连接服务器做只读检查：备份根是否存在且可写、每个源目录的文件数与总大小，并打印将要写入的目标路径。不复制任何文件，也不写日志。
-
-### 3. 备份并登记日志（推荐）
+lan 示例：
 
 ```powershell
-& "$SkillRoot/scripts/backup_and_log.ps1" -Yes `
-  -Purpose '用于 2H-MoS2 能带图' `
-  -Conclusion 'PBE 带隙约 1.6 eV，间接带隙'
+& "$SkillRoot/scripts/backup_completed_tasks.ps1" `
+  -Server lan `
+  -Path /data/yangjianhui_group/user/project `
+  -Yes
 ```
 
-- 不带 `-Yes` 时同样只打印计划，不复制、不写日志；只想看计划也可以显式加 `-DryRun`。
-- 备份成功后自动写入 `VaspTaskList.md`，并报告任务ID、备份目录、文件数/大小和 `verify` 结果。
-- 校验结果不是 `PASS` 时不会写日志，也不会声称成功。
+默认参数：
 
-### 4. 连同本机项目目录一起归档
+- 备份根：`/home/bak`
+- Excel：`/home/bak/VaspLog.xlsx`
+- 状态索引：`/home/bak/.vasp_task_backup/index.json`
+
+可显式覆盖：
 
 ```powershell
-& "$SkillRoot/scripts/backup_and_log.ps1" -Yes -LocalDirectory '.\mos2_u' `
-  -Purpose '用于能带图' -Conclusion '带隙 1.6 eV'
+& "$SkillRoot/scripts/backup_completed_tasks.ps1" `
+  -Server yang `
+  -Path /home/qzxy/a `
+  -BackupRoot /home/bak `
+  -LogPath /home/bak/VaspLog.xlsx `
+  -Yes
 ```
 
-本机目录会上传到本次备份目录的 `local_project/` 下，并做 SHA256 核对（结果里显示 `LocalVerify : SHA256_PASS`）。
+### 3. 深度内容检测
 
-### 5. 只更新日志
+默认比较文件路径、类型、大小、mtime、ctime 和权限，能检测常规内容写入、替换、增删文件。需要进一步比较每个文件 SHA256 时：
 
 ```powershell
-& "$SkillRoot/scripts/update_task_log.ps1" -Yes `
-  -TaskId VT-20260913-162837-mos2_u `
-  -Purpose '用于能带图' -Conclusion '带隙 1.6 eV'
+& "$SkillRoot/scripts/backup_completed_tasks.ps1" `
+  -Server yang `
+  -Path /home/qzxy/a `
+  -DeepCheck `
+  -Yes
 ```
 
-这条路径不复制数据，只写日志。注意它会用本次传入的字段重建整行，没传的字段（例如 `-BackupDirectory`、`-Verification`）会留空，所以补写结论时要把已有的备份地址一并带上。
+首次全量使用 `-DeepCheck` 会读取所有任务文件的完整内容，大目录可能很慢；后续会复用未变化文件的已有哈希。
 
-### 6. 查看现状
+## 增量状态
 
-```powershell
-& "$SkillRoot/scripts/list_vasp_projects.ps1" -Server yang
-& "$SkillRoot/scripts/list_vasp_projects.ps1" -Server lan
-```
-
-列出 `~/vasp_codex` 下的任务目录（文件数、大小、是否为当前绑定）、备份根下已有的项目文件夹与备份子目录，以及日志文件大小。
-
-### 忘记先声明项目怎么办
-
-不要凭目录名猜归属。先列出远程目录，让用户确认哪些属于当前任务，再补绑定后备份：
-
-```powershell
-& "$SkillRoot/scripts/list_vasp_projects.ps1" -Server yang
-
-& "$SkillRoot/scripts/new_vasp_project.ps1" -Server yang -ProjectName mos2_u `
-  -Source vasp_codex/mos2_u_relax,vasp_codex/mos2_u_scf
-
-& "$SkillRoot/scripts/backup_and_log.ps1" -Yes -Purpose '...' -Conclusion '...'
-```
-
-## 备份目录结构
+内部目录结构：
 
 ```text
-/home/bak/
-├─ VaspTaskList.md                     统一任务日志（所有服务器共用一份）
-└─ <项目名>/                           一个项目只占这一个文件夹
-   ├─ <yyyyMMdd_HHmmss>/               每次备份一个时间戳子目录
-   │  ├─ <远程任务目录名>/             原样复制，含全部文件
-   │  ├─ local_project/                可选：本机项目目录
-   │  ├─ codex-backup-manifest.txt     文件清单、来源与时间
-   │  └─ codex-backup-sha256.txt       SHA256 清单（默认对不超过 256 MB 的文件计算）
-   └─ ...                              项目文件夹里可以再放自己的图表、说明等
+/home/bak/.vasp_task_backup/
+├─ index.json                        当前任务状态索引
+├─ index.json.journal                中断安全的增量状态日志
+├─ staging/                          原子替换前暂存区
+├─ versions/<server>/<key>/<time>/   历史版本
+└─ log-backups/                      VaspLog.xlsx 最近 5 份备份
 ```
 
-同一个项目重复备份只新增时间戳子目录，项目文件夹已存在时直接复用。目标子目录同名时停止，不覆盖、不合并、不删除。需要给本次备份一个可读后缀时加 `-Label v2`，目录写成 `<时间戳>_v2`。
+索引键同时包含服务器和源绝对路径，避免 yang/lan 相同路径互相覆盖。
 
-## 任务日志
+如果两台服务器确实存在相同的源绝对路径，镜像目标会相同；脚本会直接失败，避免一台服务器覆盖另一台的当前镜像。此时应缩小扫描路径，或为其中一台显式使用不同的备份根。
 
-日志写在**备份主机**的 `/home/bak/VaspTaskList.md`（全局一份，yang 和 lan 的项目都登记在这里，靠 `服务器` 列区分）。文件不存在时自动创建；已存在时只在表格中追加或更新对应任务ID的行，不重写原有内容。字段定义与写入规则见 `references/task-log-format.md`。
+首次遇到已有镜像目录但没有索引时：
 
-| 列 | 含义 |
-|---|---|
-| 任务ID | 默认 `VT-<yyyyMMdd>-<HHmmss>-<项目名>`，也可用 `-TaskId` 指定 |
-| 时间 | 写入时的服务器本地时间 |
-| 服务器 | 项目所在的服务器（yang / lan） |
-| 任务地址 | 项目服务器上展开后的真实远程目录 |
-| 备份地址 | 本次备份目录 |
-| 使用者 | 项目所在服务器上提交任务的账号（`id -un`） |
-| 使用过程 | 这批计算用于做什么图、表或流程 |
-| 计算结论 | 计算结果的核心结论 |
-| 备份校验 | 文件数、大小、SHA256 结果 |
-| 备注 | 可选 |
+- 若目录内容与源任务的文件路径、类型、大小一致，直接接管为已备份状态。
+- 否则会先保留为内部历史版本，再写入当前版本。
+- 非 VASP 目录不会自动覆盖。
 
-## 配置：备份主机与跨服务器
+## VaspLog.xlsx
 
-备份主机由 `config/servers.psd1` 的 `Common.Backup` 决定：
+工作表 `VaspLog`，表格 `VaspLogTable`，严格列：
 
-```powershell
-Common = @{
-    WorkRoot = 'vasp_codex'
-    Backup   = @{
-        Host    = 'yang'                     # 所有备份和日志都落在这台服务器
-        Root    = '/home/bak'
-        LogPath = '/home/bak/VaspTaskList.md'
-    }
-}
+```text
+编号 | 关联任务编号 | 操作人 | 时间 | 计算说明 | 使用记录 | 任务所在文件夹
 ```
 
-把 `Host` 改成 `lan` 即可把落点整体换到 lan，其余逻辑不变。
+- 以 `任务所在文件夹` 为唯一键。
+- 已存在任务更新原行，不重复追加。
+- 新任务从当前最大编号继续。
+- `关联任务编号` 只关联最近一层父任务的直接子任务，多个编号用英文逗号分隔。
+- 该列始终写为 Excel 文本单元格，避免大编号显示成浮点数。
+- `使用记录` 只写可验证的报告/论文文件名和可分析性质，不编造论文、报告或计算结论。
 
-- **项目在 yang**：在 yang 本机用 `cp -a` 复制到 `/home/bak/<项目名>/<时间戳>/`，逐文件比对文件数、字节数和 SHA256。
-- **项目在 lan**：用本机 `scp -3 -r -p` 把 `lan:~/vasp_codex/<目录>` 经本机中转复制到 `yang:/home/bak/...`，然后在 lan 和 yang 两侧分别计算清单摘要（文件数、字节数、路径尺寸表摘要、SHA256 摘要）并比对，两侧完全一致才算 `verify=PASS`。数据不在本机落盘，也不要求 lan 能登录 yang。
+详见 `references/task-log-format.md`。
 
-## 权限与限制
+## lan 跨主机流程
 
-- `/home/bak` 必须已在备份主机上存在且当前账号可写。缺失或不可写时脚本输出 `BACKUP_ROOT_MISSING` / `BACKUP_ROOT_NOT_WRITABLE` 并停止，不复制任何文件。
-- 本 skill 不提权（不使用 `sudo`），也不静默改写到其他路径；需要换落点时显式传 `-BackupRoot`、`-LogPath`。
-- `-ExcludeLargeFiles`（跳过 `WAVECAR`、`CHGCAR`）目前只在项目与备份主机为同一台机器时可用；跨服务器备份会直接报错，而不是悄悄退化成完整复制。
-- 需要跳过校验时用 `-SkipChecksum`，此时日志的 `备份校验` 列内容会相应变化。
+1. 将备份状态索引下载到本机并上传 lan 临时目录。
+2. lan 递归扫描可备份任务并判断 `new/changed/unchanged`。
+3. 对需要传输的任务在 lan 执行 `tar`，生成 manifest 和归档 SHA256。
+4. 使用本机 `scp -3` 从 lan 传到 yang 临时目录。
+5. yang 复验归档 SHA256，安全解包，核对路径/类型/大小。
+6. 原子替换镜像并写索引。
+7. 将可备份任务的登记记录传到 yang，更新 `VaspLog.xlsx`。
 
-## 安全边界
+任一步失败即停止；临时目录会在 finally 中清理，不登记未完成传输。
 
-- 服务器必须由用户明确指定，不设置默认服务器。
-- 只备份当前项目绑定文件列出的远程目录，不扫描、不猜测、不连带 `~/vasp_codex` 下的其他任务。
-- 不使用 `sudo`、不修改 SSH 配置、不删除远程目录。
-- 校验结果不是 `PASS` 时不写日志、不声称成功。
-- 不保存或回显服务器密码、私钥内容和 Materials Project API Key。
+## 目录说明
 
-## 脚本一览
+```text
+vasp_task_backup/
+├─ SKILL.md
+├─ README.md
+├─ agents/openai.yaml
+├─ config/
+│  ├─ servers.psd1
+│  ├─ servers.local.example.psd1
+│  └─ rules/backup-rules.psd1
+├─ references/task-log-format.md
+└─ scripts/
+   ├─ backup_completed_tasks.ps1
+   ├─ vasp_task_backup.py
+   ├─ vasp_backup_common.py
+   ├─ vasp_backup_scan.py
+   ├─ vasp_backup_store.py
+   ├─ vasp_xlsx_log.py
+   └─ lib/VaspTaskBackup.psm1
+```
 
-| 脚本 | 作用 |
-|---|---|
-| `scripts/new_vasp_project.ps1` | 建立 `.codex-vasp-project.json`，可选创建缺失的远程目录 |
-| `scripts/backup_current_task.ps1` | 备份当前项目；不加 `-Yes` 只打印计划 |
-| `scripts/backup_and_log.ps1` | 备份成功后写入任务日志（推荐入口） |
-| `scripts/update_task_log.ps1` | 只更新 `VaspTaskList.md`，不复制数据 |
-| `scripts/list_vasp_projects.ps1` | 列出远程任务目录、已有备份和日志文件 |
-| `scripts/select_server.ps1` | 加载指定服务器的配置与环境 |
-| `scripts/check_ssh_hosts.ps1` | 检查 SSH 别名解析与免密登录 |
+旧脚本 `backup_current_task.ps1`、`backup_and_log.ps1`、`update_task_log.ps1` 不再实现新的镜像和 Excel 规则，不要用于当前备份任务。
 
-## 常见问题
+## 更新摘要
 
-**备份会不会把别的任务一起传上去？**
-不会。只复制当前项目绑定文件里列出的目录；没有绑定就报错停止，也可以用 `-Source` 显式指定。
+当前版本相较旧流程：
 
-**重复备份会覆盖上一次吗？**
-不会。每次都进新的时间戳子目录，已有目录一律不动。
-
-**备份到一半失败了怎么办？**
-脚本保留已复制的部分并报告位置，不自动清理，也不会写日志。
-
-**能不能跳过 WAVECAR、CHGCAR？**
-项目与备份主机同机时可以加 `-ExcludeLargeFiles`；跨服务器（lan → yang）目前会直接报错，请保持完整备份或先手动处理。
-
-**日志能和别人共用一份吗？**
-可以。`/home/bak/VaspTaskList.md` 是全局一份，写入用 `flock` 加锁并原子替换，多人同时写入不会互相覆盖。
+- 从“当前项目 + 时间戳目录”改为“任务绝对路径 + 固定镜像目录”。
+- 从 `VaspTaskList.md` 改为 `VaspLog.xlsx` 原表增量更新。
+- 处理包含 `INCAR` 和 `POSCAR` 的 VASP 任务目录；`OUTCAR` 可选，存在时仍校验正常结束和明确致命错误。
+- 增加内容变化检测、旧版本保留、SHA256 校验、Excel 表格范围同步和文本关联编号。

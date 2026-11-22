@@ -2,11 +2,11 @@
     Common = @{
         WorkRoot = 'vasp_codex'
 
-        # 所有项目的备份和任务日志统一落到这一台服务器，不管项目在 yang 还是 lan。
+        # 所有任务的镜像备份和 VaspLog.xlsx 统一落到这一台服务器。
         Backup = @{
             Host    = 'yang'
             Root    = '/home/bak'
-            LogPath = '/home/bak/VaspTaskList.md'
+            LogPath = '/home/bak/VaspLog.xlsx'
         }
     }
 

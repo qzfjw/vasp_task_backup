@@ -1,4 +1,4 @@
 interface:
   display_name: "VASP Task Backup"
-  short_description: "备份 VASP 任务到 /home/bak 并登记 VaspTaskList.md"
-  default_prompt: "使用 $vasp-task-backup 备份当前 VASP 项目的服务器端计算目录到备份主机（默认 yang）的 /home/bak（lan 上的项目经本机中转复制过去），并把任务ID、地址、时间、使用者、使用过程和计算结论写入该主机的 VaspTaskList.md。"
+  short_description: "增量镜像 VASP 任务并登记 VaspLog.xlsx"
+  default_prompt: "使用 $vasp-task-backup 扫描指定服务器路径，把包含 INCAR、POSCAR 的 VASP 任务按原绝对路径镜像到 yang 的 /home/bak。OUTCAR 可以缺失；如果存在，则必须正常结束且不含明确致命错误。跳过未修改任务，修改过的任务重新备份，并把任务信息写入 /home/bak/VaspLog.xlsx。先展示 DryRun 计划，得到用户确认后再备份。"
